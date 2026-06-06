@@ -14,6 +14,8 @@ zip -r "$output_file" . \
     -x '*mypy_cache*' \
     -x '*pytest_cache*' \
     -x '*build*' \
+    -x 'data/*' \
+    -x 'cs336-basics/data/*' \
     -x '*ipynb_checkpoints*' \
     -x '*__pycache__*' \
     -x '*.pkl' \

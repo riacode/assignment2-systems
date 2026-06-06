@@ -12,7 +12,9 @@ import torch.nn as nn
 from einops import einsum, rearrange
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
+from cs336_basics.flash_attention import FlashAttention2Triton
 from cs336_basics.nn_utils import softmax
 
 logger = logging.getLogger(__name__)
@@ -248,9 +250,12 @@ class BasicsTransformerLM(nn.Module):
         # x = self.positional_encoder(embedded_tokens, positions)
         x = embedded_tokens
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             # (batch size, sequence_length, d_model)
-            x = layer(x)
+            if i % 3 == 0:
+                x = layer(x)
+            else:
+                x = checkpoint(layer, x, use_reentrant=False)
         # (batch size, sequence_length, d_model)
         x = self.ln_final(x)
         # (batch size, sequence_length, vocab_size)
@@ -396,7 +401,9 @@ class SwiGLU(nn.Module):
         self.w3 = Linear(d_model, d_ff)
 
     def forward(self, x):
-        return self.w2(silu(self.w1(x)) * self.w3(x))
+        x1 = silu(self.w1(x))
+        x1 *= self.w3(x)
+        return self.w2(x1)
 
 
 def scaled_dot_product_attention(
@@ -488,7 +495,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         Returns:
             Self-attention outputs.
         """
-        *batch_dims, sequence_length, d_model = x.size()
+        d_model = x.shape[-1]
         assert d_model == self.d_model
 
         Q = self.q_proj(x)
@@ -509,15 +516,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
             Q = self.positional_encoder(Q, token_positions)
             K = self.positional_encoder(K, token_positions)
 
-        # Construct causal mask
-        iota = torch.arange(sequence_length, device=x.device)
-        qi = rearrange(iota, "query -> query 1")
-        kj = rearrange(iota, "key   -> 1   key")
-        causal_mask = qi >= kj  # (query, key)
-        causal_mask = causal_mask.__getitem__((None,) * len(batch_dims) + (...,))  # Add appropriate leading dimensions
-
         # Shape: (..., num_heads, sequence_length, d_k)
-        attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
+        attn_output = FlashAttention2Triton.apply(Q, K, V, True)
 
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).
